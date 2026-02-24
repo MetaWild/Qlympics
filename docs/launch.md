@@ -99,3 +99,4 @@ Notes:
 4. Open ports `80/443`.
 5. Deploy:
    - `make deploy-prod`
+   - deploy runs migrations and seeds/updates one active game mode from `GAME_*` env values

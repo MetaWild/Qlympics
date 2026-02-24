@@ -9,6 +9,7 @@
     "start": "node dist/index.js",
     "start:worker": "node dist/worker.js",
     "migrate": "tsx src/scripts/migrate.ts",
+    "seed:game-mode": "tsx src/scripts/seedGameMode.ts",
     "quai:ping": "tsx scripts/quai-ping.ts",
     "quai:derive-key": "node scripts/quai-derive-private-key.js",
     "quai:balance": "tsx scripts/quai-balance.ts",

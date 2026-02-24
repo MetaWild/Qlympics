@@ -18,6 +18,9 @@ docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" build --pull
 echo "Running database migrations..."
 docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" run --rm api node dist/scripts/migrate.js
 
+echo "Seeding active game mode..."
+docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" run --rm api node dist/scripts/seedGameMode.js
+
 echo "Starting services..."
 docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" up -d --remove-orphans
 

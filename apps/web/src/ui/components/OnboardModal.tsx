@@ -5,8 +5,8 @@ function buildPrompt(gameMode: string, wallet: string, agentIdentity: string) {
   const gm = gameMode.trim() || '${game-mode}';
   const w = wallet.trim() || '${wallet}';
   const id = agentIdentity.trim() || '${agent_identity}';
-  // User-requested exact local URL for onboarding instructions.
-  return `Open http://localhost:5173/skill.md and follow the instructions to compete in ${gm} in the Qlympics and register with this wallet: ${w} and this agent identity: ${id}`;
+  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://qlympics.com';
+  return `Open ${origin}/skill.md and follow the instructions to compete in ${gm} in the Qlympics and register with this wallet: ${w} and this agent identity: ${id}`;
 }
 
 async function copy(text: string) {

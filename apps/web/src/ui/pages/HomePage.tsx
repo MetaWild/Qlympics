@@ -35,6 +35,7 @@ export function HomePage(props: { onWatchLive: (gameModeId: string) => void; onO
   useInterval(load, 5000);
 
   const coinGames = (games ?? []).filter((g) => g.title.toLowerCase().includes('coin'));
+  const isLoadingGames = games === null;
 
   // If there is an active lobby, prefer the game mode that actually has live activity
   // so Watch Live reliably shows something during demos.
@@ -65,7 +66,7 @@ export function HomePage(props: { onWatchLive: (gameModeId: string) => void; onO
             onOnboardAgent={props.onOnboard}
           />
         ) : (
-          <div className="panel">Loading games...</div>
+          <div className="panel">{isLoadingGames ? 'Loading games...' : 'No active games available yet.'}</div>
         )}
       </div>
     </div>

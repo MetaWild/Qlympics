@@ -23,6 +23,7 @@ Edit `deploy/.env.prod`:
 - `DATABASE_URL` -> managed Postgres URL
 - `REDIS_URL` -> managed Redis/Valkey URL (for cloud providers, usually `rediss://...`)
 - `QUAI_TREASURY_PRIVATE_KEY` -> treasury private key
+- `GAME_*` values -> active mode defaults seeded during deploy
 
 ## 2) Domain + DNS
 

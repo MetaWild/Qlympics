@@ -34,7 +34,7 @@ DB_WAIT_CMD = docker compose exec -T postgres sh -c "until pg_isready -U $(POSTG
 
 DB_URL = postgres://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@localhost:5432/$(POSTGRES_DB)
 
-export DATABASE_URL ?= $(DB_URL)
+DATABASE_URL ?= $(DB_URL)
 
 
 db-up:
@@ -47,16 +47,18 @@ db-down:
 
 
 db-migrate:
-	./scripts/db-migrate.sh
+	DATABASE_URL="$(DATABASE_URL)" ./scripts/db-migrate.sh
 
 
 db-verify:
-	./scripts/db-verify.sh
+	DATABASE_URL="$(DATABASE_URL)" ./scripts/db-verify.sh
 
 db-reset:
-	./scripts/db-reset.sh
+	DATABASE_URL="$(DATABASE_URL)" REDIS_URL="$(REDIS_URL)" ./scripts/db-reset.sh
 
 game-mode-upsert:
+	DATABASE_URL="$(DATABASE_URL)" \
+	REDIS_URL="$(REDIS_URL)" \
 	GAME_TITLE="$(GAME_TITLE)" \
 	GAME_MAX_PLAYERS="$(GAME_MAX_PLAYERS)" \
 	GAME_DURATION_SEC="$(GAME_DURATION_SEC)" \
