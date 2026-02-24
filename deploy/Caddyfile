@@ -1,0 +1,28 @@
+{
+	email {$QLYMPICS_EMAIL}
+}
+
+{$QLYMPICS_DOMAIN} {
+	encode zstd gzip
+
+	@ws path /ws/*
+	handle @ws {
+		reverse_proxy game-server:3003
+	}
+
+	@api path /health /stats /games /lobbies* /agents* /payouts*
+	handle @api {
+		reverse_proxy api:3001
+	}
+
+	handle {
+		reverse_proxy web:8080
+	}
+
+	header {
+		-Server
+		X-Content-Type-Options nosniff
+		X-Frame-Options DENY
+		Referrer-Policy no-referrer-when-downgrade
+	}
+}

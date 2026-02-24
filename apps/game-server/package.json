@@ -1,0 +1,23 @@
+{
+  "name": "@qlympics/game-server",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc -p tsconfig.build.json",
+    "start": "node dist/index.js",
+    "inspect": "tsx scripts/inspect-state.ts",
+    "test": "tsx --test test/**/*.test.ts",
+    "lint": "node -e \"console.log('no lint config yet')\""
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pg": "^8.12.0",
+    "redis": "^4.7.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}

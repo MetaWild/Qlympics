@@ -1,0 +1,140 @@
+name: qlympics-prod
+
+services:
+  caddy:
+    image: caddy:2.9-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    depends_on:
+      web:
+        condition: service_healthy
+      api:
+        condition: service_healthy
+      game-server:
+        condition: service_healthy
+    environment:
+      QLYMPICS_DOMAIN: ${QLYMPICS_DOMAIN}
+      QLYMPICS_EMAIL: ${QLYMPICS_EMAIL}
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - app
+
+  web:
+    build:
+      context: ..
+      dockerfile: apps/web/Dockerfile
+      args:
+        VITE_GAME_WS_URL: ${VITE_GAME_WS_URL}
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/ >/dev/null 2>&1"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app
+
+  api:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX}
+      DATABASE_POOL_IDLE_TIMEOUT_MS: ${DATABASE_POOL_IDLE_TIMEOUT_MS}
+      DATABASE_POOL_CONNECTION_TIMEOUT_MS: ${DATABASE_POOL_CONNECTION_TIMEOUT_MS}
+      QUAI_RPC_URL: ${QUAI_RPC_URL}
+      QUAI_CHAIN_ID: ${QUAI_CHAIN_ID}
+      QUAI_TREASURY_PRIVATE_KEY: ${QUAI_TREASURY_PRIVATE_KEY}
+      QUAI_TREASURY_RPC_URL: ${QUAI_TREASURY_RPC_URL}
+      POW_DIFFICULTY: ${POW_DIFFICULTY}
+      POW_EXPIRES_SECONDS: ${POW_EXPIRES_SECONDS}
+      AUTO_PAYOUTS_ENABLED: "0"
+      PAYOUT_RPC_TIMEOUT_MS: ${PAYOUT_RPC_TIMEOUT_MS}
+      PAYOUT_SEND_RETRIES: ${PAYOUT_SEND_RETRIES}
+      PAYOUT_SEND_BACKOFF_MS: ${PAYOUT_SEND_BACKOFF_MS}
+      PAYOUT_GAS_LIMIT: ${PAYOUT_GAS_LIMIT}
+      PAYOUT_GAS_PRICE_WEI: ${PAYOUT_GAS_PRICE_WEI}
+    depends_on:
+      web:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3001/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 6s
+      retries: 8
+    networks:
+      - app
+
+  payout-worker:
+    build:
+      context: ..
+      dockerfile: apps/api/Dockerfile
+    restart: unless-stopped
+    command: ["node", "dist/worker.js"]
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX}
+      DATABASE_POOL_IDLE_TIMEOUT_MS: ${DATABASE_POOL_IDLE_TIMEOUT_MS}
+      DATABASE_POOL_CONNECTION_TIMEOUT_MS: ${DATABASE_POOL_CONNECTION_TIMEOUT_MS}
+      QUAI_RPC_URL: ${QUAI_RPC_URL}
+      QUAI_CHAIN_ID: ${QUAI_CHAIN_ID}
+      QUAI_TREASURY_PRIVATE_KEY: ${QUAI_TREASURY_PRIVATE_KEY}
+      QUAI_TREASURY_RPC_URL: ${QUAI_TREASURY_RPC_URL}
+      AUTO_PAYOUTS_ENABLED: "1"
+      AUTO_PAYOUT_CONCURRENCY: ${AUTO_PAYOUT_CONCURRENCY}
+      PAYOUT_RPC_TIMEOUT_MS: ${PAYOUT_RPC_TIMEOUT_MS}
+      PAYOUT_SEND_RETRIES: ${PAYOUT_SEND_RETRIES}
+      PAYOUT_SEND_BACKOFF_MS: ${PAYOUT_SEND_BACKOFF_MS}
+      PAYOUT_GAS_LIMIT: ${PAYOUT_GAS_LIMIT}
+      PAYOUT_GAS_PRICE_WEI: ${PAYOUT_GAS_PRICE_WEI}
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"process.exit(0)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - app
+
+  game-server:
+    build:
+      context: ..
+      dockerfile: apps/game-server/Dockerfile
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      GAME_WS_PORT: 3003
+      DATABASE_URL: ${DATABASE_URL}
+      REDIS_URL: ${REDIS_URL}
+      DATABASE_POOL_MAX: ${DATABASE_POOL_MAX}
+      DATABASE_POOL_IDLE_TIMEOUT_MS: ${DATABASE_POOL_IDLE_TIMEOUT_MS}
+      DATABASE_POOL_CONNECTION_TIMEOUT_MS: ${DATABASE_POOL_CONNECTION_TIMEOUT_MS}
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3003/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))\""]
+      interval: 15s
+      timeout: 6s
+      retries: 8
+    networks:
+      - app
+
+networks:
+  app:
+    driver: bridge
+
+volumes:
+  caddy_data:
+  caddy_config:
