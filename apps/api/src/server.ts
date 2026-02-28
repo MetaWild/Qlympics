@@ -7,7 +7,24 @@ import { registerAgentRoutes } from './routes/agents.js';
 import { registerPayoutRoutes } from './routes/payouts.js';
 
 export function buildServer() {
-  const app = Fastify({ logger: true });
+  const app = Fastify({
+    logger: {
+      redact: {
+        paths: [
+          'req.headers.authorization',
+          'req.headers.x-api-key',
+          'req.headers.cookie',
+          'headers.authorization',
+          'headers.x-api-key',
+          'headers.cookie',
+          'authorization',
+          'x-api-key',
+          'cookie'
+        ],
+        censor: '[REDACTED]'
+      }
+    }
+  });
 
   app.register(registerHealthRoutes);
   app.register(registerStatsRoutes);

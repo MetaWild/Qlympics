@@ -1,4 +1,5 @@
 import { startAutoPayoutWorker } from './workers/autoPayouts.js';
+import { sanitizeError } from './logging/sanitize.js';
 
 type LogMethod = (obj: unknown, msg?: string) => void;
 
@@ -32,6 +33,6 @@ async function main() {
 
 main().catch((error) => {
   // eslint-disable-next-line no-console
-  console.error('[auto-payout-worker] Fatal startup error', error);
+  console.error('[auto-payout-worker] Fatal startup error', sanitizeError(error));
   process.exit(1);
 });

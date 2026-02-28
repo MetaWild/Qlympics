@@ -2,6 +2,7 @@ import { FastifyInstance } from 'fastify';
 import { query } from '../db.js';
 import { getTreasuryWallet } from '../quai/provider.js';
 import { executePayoutForLobby } from '../services/payoutExecutor.js';
+import { sanitizeError } from '../logging/sanitize.js';
 
 let payoutExecutionQueue: Promise<unknown> = Promise.resolve();
 
@@ -33,14 +34,14 @@ export async function registerPayoutRoutes(app: FastifyInstance): Promise<void> 
       try {
         wallet = getTreasuryWallet();
       } catch (error: any) {
-        request.log.error({ err: error }, 'Treasury wallet is not configured');
+        request.log.error({ err: sanitizeError(error) }, 'Treasury wallet is not configured');
         return reply.code(500).send({ error: 'Treasury wallet is not configured.' });
       }
 
       try {
         return await executePayoutForLobby({ lobbyId, query, wallet, log: request.log });
       } catch (error: any) {
-        request.log.error({ err: error, lobbyId }, 'Payout execution failed');
+        request.log.error({ err: sanitizeError(error), lobbyId }, 'Payout execution failed');
         return reply.code(500).send({ error: 'Payout execution failed.' });
       }
     });

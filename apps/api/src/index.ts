@@ -4,6 +4,7 @@ import { startAutoPayoutWorker } from './workers/autoPayouts.js';
 import { getQuaiProviderDebugInfo } from './quai/provider.js';
 import { getAddress } from 'quais';
 import { getTreasuryWallet } from './quai/provider.js';
+import { sanitizeError } from './logging/sanitize.js';
 
 const app = buildServer();
 
@@ -19,14 +20,14 @@ app.listen({ port: config.port, host: '0.0.0.0' })
       const w = getTreasuryWallet();
       app.log.info({ treasuryFrom: getAddress(w.address) }, 'Treasury wallet loaded');
     } catch (error: any) {
-      app.log.warn({ err: error }, 'Treasury wallet not configured');
+      app.log.warn({ err: sanitizeError(error) }, 'Treasury wallet not configured');
     }
     // Best-effort background worker (does not crash the API if it fails to start).
     startAutoPayoutWorker(app.log).catch((error) => {
-      app.log.error({ err: error }, 'Auto payout worker failed to start');
+      app.log.error({ err: sanitizeError(error) }, 'Auto payout worker failed to start');
     });
   })
   .catch((error) => {
-    app.log.error(error, 'Failed to start server');
+    app.log.error({ err: sanitizeError(error) }, 'Failed to start server');
     process.exit(1);
   });

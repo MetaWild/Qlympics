@@ -3,6 +3,7 @@ import { config } from '../config.js';
 import { query } from '../db.js';
 import { getTreasuryWallet } from '../quai/provider.js';
 import { executePayoutForLobby } from '../services/payoutExecutor.js';
+import { sanitizeError } from '../logging/sanitize.js';
 
 type LogLike = {
   info: (obj: unknown, msg?: string) => void;
@@ -56,7 +57,7 @@ export async function startAutoPayoutWorker(log: LogLike): Promise<void> {
           const res = await executePayoutForLobby({ lobbyId, query, wallet, log });
           log.info({ lobbyId, ...res }, 'Auto payout executed');
         } catch (error: any) {
-          log.error({ err: error, lobbyId }, 'Auto payout failed');
+          log.error({ err: sanitizeError(error), lobbyId }, 'Auto payout failed');
         } finally {
           inFlight -= 1;
           // Process the next lobby soon, but don't starve the event loop.

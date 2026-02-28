@@ -5,4 +5,7 @@
 .DS_Store
 *.log
 .env
+.env.prod
+*.pem
+*.key
 deploy/.env.prod

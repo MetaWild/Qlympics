@@ -1,6 +1,7 @@
 import { getAddress, keccak256, parseQuai, type Wallet } from 'quais';
 import { config } from '../config.js';
 import { reserveTreasuryNonces } from './treasuryNonce.js';
+import { redactSecrets, sanitizeError } from '../logging/sanitize.js';
 
 export type PayoutRow = {
   id: string;
@@ -243,9 +244,12 @@ export async function executePayoutForLobby(opts: {
       ]);
       sentCount += 1;
     } catch (error: any) {
-      log.error({ err: error, payoutItemId: item.id, payoutAddress: item.payout_address }, 'Failed to send payout tx');
+      log.error(
+        { err: sanitizeError(error), payoutItemId: item.id, payoutAddress: item.payout_address },
+        'Failed to send payout tx'
+      );
       await query(`UPDATE payout_items SET status = 'FAILED', error = $1, attempted_at = now() WHERE id = $2`, [
-        String(error?.message ?? error),
+        redactSecrets(String(error?.message ?? error)),
         item.id
       ]);
       failedCount += 1;

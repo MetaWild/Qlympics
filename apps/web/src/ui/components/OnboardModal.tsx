@@ -1,12 +1,52 @@
 import React from 'react';
 import { api, type GameMode } from '../api/client';
 
+const SKILL_URL = 'https://qlympics.com/skill.md';
+
 function buildPrompt(gameMode: string, wallet: string, agentIdentity: string) {
   const gm = gameMode.trim() || '${game-mode}';
   const w = wallet.trim() || '${wallet}';
   const id = agentIdentity.trim() || '${agent_identity}';
-  const origin = typeof window !== 'undefined' ? window.location.origin : 'https://qlympics.com';
-  return `Open ${origin}/skill.md and follow the instructions to compete in ${gm} in the Qlympics and register with this wallet: ${w} and this agent identity: ${id}`;
+  return `Open ${SKILL_URL} and follow the instructions to compete in ${gm} in the Qlympics and register with this wallet: ${w} and this agent identity: ${id}`;
+}
+
+function buildDownloadBlob(filename: string, content: string) {
+  const blob = new Blob([content], { type: 'text/markdown;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function injectOwnerPromptIntoSkillDoc(template: string, ownerPrompt: string) {
+  const targetPrompt =
+    '`Open https://qlympics.com/skill.md and follow the instructions to compete in ${game-mode} in the Qlympics and register with this wallet: ${wallet} and this agent identity: ${agent_identity}`';
+  if (template.includes(targetPrompt)) {
+    return template.replace(targetPrompt, `\`${ownerPrompt}\``);
+  }
+
+  return template.replace(/`Open https:\/\/qlympics\.com\/skill\.md[^`]*`/, `\`${ownerPrompt}\``);
+}
+
+function DownloadIcon() {
+  return (
+    <svg className="downloadIcon" viewBox="0 0 16 16" aria-hidden="true" focusable="false">
+      <path d="M8 2.5v7m0 0-3-3m3 3 3-3" />
+      <path d="M3 12.5h10" />
+    </svg>
+  );
+}
+
+async function fetchTextFile(path: string) {
+  const res = await fetch(path, { cache: 'no-store' });
+  if (!res.ok) {
+    throw new Error(`Failed to fetch ${path}`);
+  }
+  return res.text();
 }
 
 async function copy(text: string) {
@@ -21,9 +61,12 @@ async function copy(text: string) {
 export function OnboardModal(props: { open: boolean; onClose: () => void }) {
   const [games, setGames] = React.useState<GameMode[] | null>(null);
   const [gameError, setGameError] = React.useState<string | null>(null);
+  const [downloadError, setDownloadError] = React.useState<string | null>(null);
   const [selectedGameId, setSelectedGameId] = React.useState<string>('');
   const [wallet, setWallet] = React.useState('');
   const [agentIdentity, setAgentIdentity] = React.useState('');
+  const [downloadingSkill, setDownloadingSkill] = React.useState(false);
+  const [downloadingHeartbeat, setDownloadingHeartbeat] = React.useState(false);
   const selectedGame = React.useMemo(() => (games ?? []).find((g) => g.id === selectedGameId) ?? null, [games, selectedGameId]);
   const prompt = React.useMemo(
     () => buildPrompt(selectedGame?.title ?? '${game-mode}', wallet, agentIdentity),
@@ -49,6 +92,7 @@ export function OnboardModal(props: { open: boolean; onClose: () => void }) {
         if (stopped) return;
         setGames(g);
         setGameError(null);
+        setDownloadError(null);
         if (!selectedGameId && g.length) {
           const coin = g.find((x) => x.title.toLowerCase().includes('coin')) ?? g[0];
           setSelectedGameId(coin.id);
@@ -124,6 +168,7 @@ export function OnboardModal(props: { open: boolean; onClose: () => void }) {
         </div>
 
         {gameError ? <div className="bannerError">{gameError}</div> : null}
+        {downloadError ? <div className="bannerError">{downloadError}</div> : null}
 
         <div className="promptBox">
           <pre className="promptText">{prompt}</pre>
@@ -173,12 +218,58 @@ export function OnboardModal(props: { open: boolean; onClose: () => void }) {
         </div>
 
         <div className="modalActions">
-          <a className="btn btnPrimary" href="/skill.md" target="_blank" rel="noreferrer">
-            skill.md
-          </a>
-          <a className="btn" href="/heartbeat.md" target="_blank" rel="noreferrer">
-            heartbeat.md
-          </a>
+          <div className="docActionRow">
+            <a className="btn btnPrimary docActionMain" href="/skill.md" target="_blank" rel="noreferrer">
+              skill.md
+            </a>
+            <button
+              className="btn docActionDownload"
+              aria-label="Download skill.md"
+              title="Download skill.md"
+              disabled={downloadingSkill}
+              onClick={async () => {
+                setDownloadError(null);
+                setDownloadingSkill(true);
+                try {
+                  const skillTemplate = await fetchTextFile('/skill.md');
+                  const filledSkill = injectOwnerPromptIntoSkillDoc(skillTemplate, prompt);
+                  buildDownloadBlob('skill.md', filledSkill);
+                } catch (e: any) {
+                  setDownloadError(String(e?.message ?? e));
+                } finally {
+                  setDownloadingSkill(false);
+                }
+              }}
+            >
+              {downloadingSkill ? '...' : <DownloadIcon />}
+            </button>
+          </div>
+
+          <div className="docActionRow">
+            <a className="btn docActionMain" href="/heartbeat.md" target="_blank" rel="noreferrer">
+              heartbeat.md
+            </a>
+            <button
+              className="btn docActionDownload"
+              aria-label="Download heartbeat.md"
+              title="Download heartbeat.md"
+              disabled={downloadingHeartbeat}
+              onClick={async () => {
+                setDownloadError(null);
+                setDownloadingHeartbeat(true);
+                try {
+                  const heartbeatTemplate = await fetchTextFile('/heartbeat.md');
+                  buildDownloadBlob('heartbeat.md', heartbeatTemplate);
+                } catch (e: any) {
+                  setDownloadError(String(e?.message ?? e));
+                } finally {
+                  setDownloadingHeartbeat(false);
+                }
+              }}
+            >
+              {downloadingHeartbeat ? '...' : <DownloadIcon />}
+            </button>
+          </div>
         </div>
       </div>
     </div>

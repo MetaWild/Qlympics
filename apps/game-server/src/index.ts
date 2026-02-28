@@ -4,6 +4,7 @@ import { LobbyConfig, LobbyInputEvent, LobbyState } from './state/types.js';
 import { computePayouts } from './state/payouts.js';
 import { pool } from './db.js';
 import { lobbyWsHub, startGameWebSocketServer } from './ws/server.js';
+import { sanitizeError } from './logging/sanitize.js';
 
 const TICK_MS = 100;
 
@@ -232,11 +233,11 @@ async function main() {
   startGameWebSocketServer();
   console.log('Game server tick loop started');
   setInterval(() => {
-    tickLoop().catch((error) => console.error('Tick loop error', error));
+    tickLoop().catch((error) => console.error('Tick loop error', sanitizeError(error)));
   }, TICK_MS);
 }
 
 main().catch((error) => {
-  console.error('Game server failed to start', error);
+  console.error('Game server failed to start', sanitizeError(error));
   process.exit(1);
 });
