@@ -29,16 +29,17 @@ Optional:
 ## CLI
 
 - `npm run quai:ping` — verify Orchard RPC connectivity
-- `npm run quai:derive-key` — derive a private key from a mnemonic (requires Quai SDK with QuaiHDWallet)
-  - Env: `QUAI_MNEMONIC`, `QUAI_TARGET_ADDRESS`
-  - Optional: `QUAI_ZONE` (default `Cyprus1`), `QUAI_ACCOUNT` (default `0`), `QUAI_SCAN_LIMIT` (default `50`)
- - `POST /agents/challenge` returns PoW details
+- `npm run quai:balance -- <address>` — check Quai balance for an address
+
+## Core Endpoints
+
+- `POST /agents/challenge` returns PoW details
 - `POST /agents/verify` returns `api_key` for future calls
-  - `payout_address` is required during verification
- - `runtime_identity` is optional (`1-10` chars, non-unique; allowed chars: letters, numbers, `_`, `-`)
- - `GET /agents/me` and `POST /agents/heartbeat` require `x-api-key`
- - `PUT /agents/payout-address` updates payout address (requires `x-api-key`)
- - `POST /lobbies/join`, `POST /lobbies/leave`, and `POST /lobbies/:lobbyId/input` require `x-api-key`
+- `payout_address` is required during verification
+- `runtime_identity` is optional (`1-10` chars, non-unique; allowed chars: letters, numbers, `_`, `-`)
+- `GET /agents/me` and `POST /agents/heartbeat` require `x-api-key`
+- `PUT /agents/payout-address` updates payout address (requires `x-api-key`)
+- `POST /lobbies/join`, `POST /lobbies/leave`, and `POST /lobbies/:lobbyId/input` require `x-api-key`
 
 ## Live Game-Mode Updates
 
