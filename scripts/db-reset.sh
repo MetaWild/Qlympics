@@ -6,12 +6,38 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PSQL_BASE=()
 REDIS_BASE=()
 
+sanitize_database_url_for_psql() {
+  local raw="$1"
+  if [[ -z "$raw" ]]; then
+    printf '%s' "$raw"
+    return
+  fi
+  if command -v python3 >/dev/null 2>&1; then
+    DATABASE_URL_RAW="$raw" python3 - <<'PY'
+import os
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+
+raw = os.environ.get("DATABASE_URL_RAW", "")
+parts = urlsplit(raw)
+query = [(k, v) for (k, v) in parse_qsl(parts.query, keep_blank_values=True) if k.lower() != "uselibpqcompat"]
+print(urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment)), end="")
+PY
+    return
+  fi
+  printf '%s' "$raw" | sed -E \
+    -e 's/([?&])uselibpqcompat=[^&]*&/\1/g' \
+    -e 's/([?&])uselibpqcompat=[^&]*$//' \
+    -e 's/\?&/\?/' \
+    -e 's/\?$//'
+}
+
 if command -v psql >/dev/null 2>&1; then
   if [[ -z "${DATABASE_URL:-}" ]]; then
     echo "DATABASE_URL is not set" >&2
     exit 1
   fi
-  PSQL_BASE=(psql "$DATABASE_URL" -v ON_ERROR_STOP=1)
+  DATABASE_URL_PSQL="$(sanitize_database_url_for_psql "$DATABASE_URL")"
+  PSQL_BASE=(psql "$DATABASE_URL_PSQL" -v ON_ERROR_STOP=1)
   if command -v redis-cli >/dev/null 2>&1; then
     if [[ -n "${REDIS_URL:-}" ]]; then
       REDIS_BASE=(redis-cli -u "$REDIS_URL")
