@@ -1,4 +1,4 @@
-.PHONY: setup test test-scale lint fmt dev ci db-up db-down db-migrate db-verify db-reset game-mode-upsert api-install api-dev api-test api-build api-quai-ping game-install game-dev game-test game-build game-inspect smoke e2e
+.PHONY: setup test test-scale lint fmt dev ci db-up db-down db-migrate db-verify db-reset game-mode-upsert api-install api-dev api-test api-build api-quai-ping game-install game-dev game-test game-build game-inspect smoke e2e e2e-prod
 .PHONY: web-install web-dev web-build web-preview
 .PHONY: demo-ui demo-ui-scale
 .PHONY: deploy-prod deploy-prod-restart deploy-prod-logs
@@ -120,6 +120,9 @@ smoke:
 
 e2e:
 	./scripts/e2e.sh
+
+e2e-prod:
+	E2E_MODE=external ./scripts/e2e.sh
 
 demo-ui:
 	./scripts/demo-ui.sh

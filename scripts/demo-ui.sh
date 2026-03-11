@@ -36,6 +36,8 @@ fi
 E2E_API_PORT="${E2E_API_PORT:-3002}"
 API_URL="${API_URL:-http://localhost:${E2E_API_PORT}}"
 export API_URL
+LOCAL_DATABASE_URL="${LOCAL_DATABASE_URL:-postgres://${POSTGRES_USER:-qlympics}:${POSTGRES_PASSWORD:-qlympics}@localhost:5432/${POSTGRES_DB:-qlympics}}"
+LOCAL_REDIS_URL="${LOCAL_REDIS_URL:-redis://localhost:6379}"
 
 AUTO_PAYOUTS_ENABLED="${AUTO_PAYOUTS_ENABLED:-0}"
 if [[ "${E2E_SCENARIO:-}" == "scale" && "${E2E_SCALE_EXECUTE_PAYOUTS:-0}" == "1" ]]; then
@@ -77,7 +79,7 @@ if command -v lsof >/dev/null 2>&1; then
   lsof -ti "tcp:3003" | xargs -r kill >/dev/null 2>&1 || true
 fi
 
-make setup
+DATABASE_URL="$LOCAL_DATABASE_URL" REDIS_URL="$LOCAL_REDIS_URL" make setup
 echo "Clearing redis state..."
 docker compose exec -T redis redis-cli FLUSHALL >/dev/null
 
@@ -93,6 +95,8 @@ fi
 
 # Start API and game server.
 PORT="$E2E_API_PORT" \
+  DATABASE_URL="$LOCAL_DATABASE_URL" \
+  REDIS_URL="$LOCAL_REDIS_URL" \
   AUTO_PAYOUTS_ENABLED="$AUTO_PAYOUTS_ENABLED" \
   POW_DIFFICULTY="${SCALE_POW_DIFFICULTY:-${POW_DIFFICULTY:-}}" \
   GAME_GRID_WIDTH="${E2E_GRID_WIDTH:-}" \
@@ -102,6 +106,7 @@ PORT="$E2E_API_PORT" \
 API_PID=$!
 
 GAME_WS_PORT="${GAME_WS_PORT:-3003}" \
+  REDIS_URL="$LOCAL_REDIS_URL" \
   npm --prefix apps/game-server run dev >"$GAME_LOG" 2>&1 &
 GAME_PID=$!
 

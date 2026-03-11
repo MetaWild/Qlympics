@@ -2,6 +2,7 @@
 import hashlib
 import json
 import os
+import shutil
 import socket
 import subprocess
 import sys
@@ -9,6 +10,7 @@ import time
 import urllib.request
 import calendar
 import re
+import math
 
 API_URL = os.getenv("API_URL", "http://localhost:3001").rstrip("/")
 QUAI_RPC_URL = os.getenv("QUAI_RPC_URL", "https://orchard.rpc.quai.network/cyprus1")
@@ -22,9 +24,12 @@ POW_MAX_ITERS = int(os.getenv("POW_MAX_ITERS", "500000"))
 TREASURY_PRIVATE_KEY = os.getenv("QUAI_TREASURY_PRIVATE_KEY", "")
 AGENT_PAYOUT_ADDRESS = os.getenv("E2E_AGENT_PAYOUT_ADDRESS", "0x00482Eebe76c6F818c308cFFD8b7eAa19B2E504d")
 AGENT2_PAYOUT_ADDRESS = os.getenv("E2E_AGENT2_PAYOUT_ADDRESS", "0x0068d788E534DE2aC81b523Ed3C8F735269E6629")
-PLAYER_COUNT = int(os.getenv("E2E_PLAYER_COUNT", "2"))
+# Back-compat aliases:
+# - E2E_AGENT_AMOUNT can drive 2-player demo/completion count
+# - E2E_PAYOUT_AMOUNT can drive reward pool if E2E_REWARD_POOL is unset
+PLAYER_COUNT = int(os.getenv("E2E_PLAYER_COUNT", os.getenv("E2E_AGENT_AMOUNT", "2")))
 LOG_MOVES = os.getenv("E2E_LOG_MOVES", "1") != "0"
-REWARD_POOL = os.getenv("E2E_REWARD_POOL", "1")
+REWARD_POOL = os.getenv("E2E_REWARD_POOL", os.getenv("E2E_PAYOUT_AMOUNT", "1"))
 COIN_WAIT_SEC = float(os.getenv("E2E_COIN_WAIT_SEC", "10"))
 MOVE_TIMEOUT_SEC = float(os.getenv("E2E_MOVE_TIMEOUT_SEC", "20"))
 PAYOUT_WAIT_SEC = float(os.getenv("E2E_PAYOUT_WAIT_SEC", "30"))
@@ -41,6 +46,14 @@ JOIN_DELAY_SEC = float(os.getenv("E2E_JOIN_DELAY_SEC", "0"))
 WEB_URL = os.getenv("E2E_WEB_URL", "http://localhost:5173").rstrip("/")
 DEMO_FINISH_GRACE_SEC = float(os.getenv("E2E_DEMO_FINISH_GRACE_SEC", "60"))
 SCENARIO = os.getenv("E2E_SCENARIO", "").strip().lower()  # "", "scale"
+E2E_USE_EXISTING_STACK = os.getenv("E2E_USE_EXISTING_STACK", "0") == "1"
+E2E_STATE_SOURCE = os.getenv("E2E_STATE_SOURCE", "api" if E2E_USE_EXISTING_STACK else "auto").strip().lower()
+E2E_USE_DB_HELPERS = os.getenv("E2E_USE_DB_HELPERS", "0" if E2E_USE_EXISTING_STACK else "1") == "1"
+E2E_REQUIRE_PAYOUT = os.getenv("E2E_REQUIRE_PAYOUT", "0" if E2E_USE_EXISTING_STACK else "1") == "1"
+E2E_GAME_MODE_ID = os.getenv("E2E_GAME_MODE_ID", "").strip()
+E2E_GAME_MODE = os.getenv("E2E_GAME_MODE", "Coin Runner").strip()
+E2E_AUTO_FILL_LOBBY = os.getenv("E2E_AUTO_FILL_LOBBY", "1") == "1"
+UUID_RE = re.compile(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
 
 def log(msg: str):
     print(msg, flush=True)
@@ -131,6 +144,238 @@ def run_cmd(args):
     return result.stdout.strip()
 
 
+def can_use_psql():
+    return shutil.which("psql") is not None and bool(os.getenv("DATABASE_URL", "").strip())
+
+
+def can_use_node_pg():
+    return shutil.which("node") is not None and os.path.exists("apps/api/node_modules/pg")
+
+
+def has_local_docker_postgres():
+    if shutil.which("docker") is None:
+        return False
+    result = subprocess.run(["docker", "compose", "ps", "-q", "postgres"], capture_output=True, text=True)
+    return result.returncode == 0 and bool(result.stdout.strip())
+
+
+def run_sql_via_node_pg(sql: str):
+    db_url = os.getenv("DATABASE_URL", "").strip()
+    if not db_url:
+        raise RuntimeError("DATABASE_URL is required for node-pg SQL helper")
+
+    node_js = r"""
+const { Client } = require('./apps/api/node_modules/pg');
+const dbUrl = process.env.DATABASE_URL;
+const sql = process.argv[1];
+(async () => {
+  const client = new Client({ connectionString: dbUrl });
+  await client.connect();
+  const res = await client.query(sql);
+  const lines = [];
+  for (const row of res.rows) {
+    const values = Object.values(row).map((v) => (v == null ? '' : String(v)));
+    lines.push(values.join('|'));
+  }
+  process.stdout.write(lines.join('\n'));
+  await client.end();
+})().catch((err) => {
+  console.error(err?.stack || String(err));
+  process.exit(1);
+});
+"""
+    env = dict(os.environ)
+    env["DATABASE_URL"] = db_url
+    result = subprocess.run(["node", "-e", node_js, sql], capture_output=True, text=True, env=env)
+    if result.returncode != 0:
+        raise RuntimeError(f"Node SQL helper failed: {result.stderr.strip()}")
+    return result.stdout.strip()
+
+
+def run_sql(sql: str):
+    if not E2E_USE_DB_HELPERS:
+        raise RuntimeError("DB helpers are disabled (E2E_USE_DB_HELPERS=0)")
+
+    if bool(os.getenv("DATABASE_URL", "").strip()) and can_use_node_pg():
+        return run_sql_via_node_pg(sql)
+
+    if can_use_psql():
+        db_url = os.getenv("DATABASE_URL", "").strip()
+        return run_cmd(["psql", db_url, "-tA", "-v", "ON_ERROR_STOP=1", "-c", sql])
+
+    if has_local_docker_postgres():
+        return run_cmd([
+            "docker",
+            "compose",
+            "exec",
+            "-T",
+            "-e",
+            f"PGPASSWORD={POSTGRES_PASSWORD}",
+            "postgres",
+            "psql",
+            "-U",
+            POSTGRES_USER,
+            "-d",
+            POSTGRES_DB,
+            "-tA",
+            "-c",
+            sql,
+        ])
+
+    raise RuntimeError("No DB helper available: set DATABASE_URL+psql or run local docker compose postgres")
+
+
+def extract_first_uuid(text: str) -> str:
+    if not text:
+        return ""
+    for line in text.splitlines():
+        m = UUID_RE.search(line.strip())
+        if m:
+            return m.group(0)
+    m = UUID_RE.search(text)
+    if m:
+        return m.group(0)
+    return ""
+
+
+def join_lobby(game_mode_id: str, api_key: str, label: str = ""):
+    deadline = time.time() + 20
+    attempts = 0
+    while True:
+        attempts += 1
+        try:
+            return http_json(
+                "POST",
+                "/lobbies/join",
+                body={"game_mode_id": game_mode_id},
+                headers={"x-api-key": api_key},
+            )
+        except RuntimeError as exc:
+            msg = str(exc)
+            transient_404 = "HTTP 404" in msg and "Game mode not found" in msg
+            if transient_404 and time.time() < deadline:
+                if attempts == 1 or attempts % 5 == 0:
+                    tag = f" ({label})" if label else ""
+                    log(
+                        f"Join retry{tag}: game mode {game_mode_id} not visible yet "
+                        f"(attempt {attempts}), retrying..."
+                    )
+                time.sleep(0.5)
+                continue
+            raise
+
+
+def get_lobby_state(lobby_id: str):
+    api_err = None
+    if E2E_STATE_SOURCE in ("api", "auto"):
+        try:
+            _status, state = http_json("GET", f"/lobbies/{lobby_id}/state")
+            return state
+        except RuntimeError as exc:
+            if "HTTP 404" in str(exc):
+                return None
+            api_err = exc
+            if E2E_STATE_SOURCE == "api":
+                raise
+
+    if E2E_STATE_SOURCE in ("redis", "auto"):
+        payload = redis_get(f"lobby:{lobby_id}:state")
+        if payload and payload != "(nil)":
+            try:
+                return json.loads(payload)
+            except json.JSONDecodeError:
+                return None
+        return None
+
+    if api_err:
+        raise api_err
+    return None
+
+
+def get_lobby_players(lobby_id: str):
+    _status, rows = http_json("GET", f"/lobbies/{lobby_id}/players")
+    return rows
+
+
+def get_lobby_summary(lobby_id: str):
+    _status, rows = http_json("GET", "/lobbies")
+    for row in rows:
+        if str(row.get("id", "")) == lobby_id:
+            return row
+    return None
+
+
+def get_agent_id(api_key: str):
+    _status, me = http_json("GET", "/agents/me", headers={"x-api-key": api_key})
+    return str(me["id"])
+
+
+def get_or_create_game_mode(max_players: int, duration_sec: int, coins_per_match: int, reward_pool_quai=None):
+    if E2E_USE_DB_HELPERS:
+        return create_game_mode(max_players=max_players, duration_sec=duration_sec, coins_per_match=coins_per_match, reward_pool_quai=reward_pool_quai)
+
+    desired = E2E_GAME_MODE_ID
+    if desired:
+        return desired
+
+    _status, games = http_json("GET", "/games")
+    if not games:
+        raise RuntimeError("No active game modes found. Set E2E_GAME_MODE_ID or ensure /games has active modes.")
+
+    target = None
+    target_name = E2E_GAME_MODE.lower()
+    for g in games:
+        title = str(g.get("title", ""))
+        if title.lower() == target_name:
+            target = g
+            break
+    if target is None:
+        for g in games:
+            title = str(g.get("title", ""))
+            if target_name and target_name in title.lower():
+                target = g
+                break
+    if target is None:
+        target = games[0]
+    return str(target["id"])
+
+
+def ensure_lobby_active(game_mode_id: str, lobby_id: str):
+    start = time.time()
+    filler_idx = 0
+    while time.time() - start <= max(MOVE_TIMEOUT_SEC, 25):
+        summary = get_lobby_summary(lobby_id)
+        if not summary:
+            time.sleep(0.5)
+            continue
+
+        status = str(summary.get("status", "")).upper()
+        if status == "ACTIVE":
+            return
+
+        max_players = int(summary.get("max_players", 0) or 0)
+        joined_players = int(summary.get("joined_players", 0) or 0)
+        needed = max(0, max_players - joined_players)
+        if needed <= 0:
+            time.sleep(0.5)
+            continue
+
+        if not E2E_AUTO_FILL_LOBBY:
+            raise RuntimeError(
+                f"Lobby {lobby_id} is WAITING ({joined_players}/{max_players}). "
+                "Set E2E_AUTO_FILL_LOBBY=1 or use a 2-player game mode."
+            )
+
+        for _ in range(needed):
+            filler_idx += 1
+            wallet = AGENT_PAYOUT_ADDRESS if filler_idx % 2 == 0 else AGENT2_PAYOUT_ADDRESS
+            filler_key = register_agent(wallet, f"F{filler_idx:03d}")
+            join_lobby(game_mode_id, filler_key, label=f"filler-{filler_idx:03d}")
+        time.sleep(0.3)
+
+    raise RuntimeError(f"Lobby {lobby_id} did not become ACTIVE in time")
+
+
 def create_game_mode(max_players: int, duration_sec: int, coins_per_match: int, reward_pool_quai=None):
     pool = reward_pool_quai if reward_pool_quai is not None else REWARD_POOL
     sql = (
@@ -138,26 +383,23 @@ def create_game_mode(max_players: int, duration_sec: int, coins_per_match: int, 
         "VALUES ('Coin Runner', %d, %d, %d, %s, 'ACTIVE') RETURNING id;"
         % (max_players, duration_sec, coins_per_match, pool)
     )
-    output = run_cmd([
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "-e",
-        f"PGPASSWORD={POSTGRES_PASSWORD}",
-        "postgres",
-        "psql",
-        "-U",
-        POSTGRES_USER,
-        "-d",
-        POSTGRES_DB,
-        "-tA",
-        "-c",
-        sql,
-    ])
-    game_mode_id = output.splitlines()[0].strip()
+    output = run_sql(sql)
+    game_mode_id = extract_first_uuid(output)
     if not game_mode_id:
-        raise RuntimeError("Failed to create game mode")
+        fallback = run_sql(
+            "SELECT id FROM game_modes "
+            "WHERE status = 'ACTIVE' "
+            "AND title = 'Coin Runner' "
+            f"AND max_players = {max_players} "
+            f"AND duration_sec = {duration_sec} "
+            f"AND coins_per_match = {coins_per_match} "
+            f"AND reward_pool_quai = {pool} "
+            "LIMIT 1;"
+        )
+        game_mode_id = extract_first_uuid(fallback)
+    if not game_mode_id:
+        raise RuntimeError(f"Failed to create game mode; SQL output was: {output!r}")
+    log(f"Created game mode id={game_mode_id}")
     return game_mode_id
 
 
@@ -234,9 +476,9 @@ def wei_to_quai(wei: int) -> float:
 def wait_for_state(lobby_id: str):
     start = time.time()
     while True:
-        state_raw = redis_get(f"lobby:{lobby_id}:state")
-        if state_raw and state_raw != "(nil)":
-            return json.loads(state_raw)
+        state = get_lobby_state(lobby_id)
+        if state:
+            return state
         if time.time() - start > COIN_WAIT_SEC:
             raise RuntimeError(
                 f"Timed out waiting for lobby state after {COIN_WAIT_SEC:.0f}s. "
@@ -248,11 +490,9 @@ def wait_for_state(lobby_id: str):
 def wait_for_lobby_finish(lobby_id: str):
     deadline = time.time() + FINISH_WAIT_SEC
     while time.time() < deadline:
-        state_raw = redis_get(f"lobby:{lobby_id}:state")
-        if state_raw and state_raw != "(nil)":
-            state = json.loads(state_raw)
-            if state.get("status") == "FINISHED":
-                return
+        state = get_lobby_state(lobby_id)
+        if state and state.get("status") == "FINISHED":
+            return
         time.sleep(0.5)
     raise RuntimeError(f"Lobby did not finish within {FINISH_WAIT_SEC:.0f}s")
 
@@ -275,22 +515,16 @@ def explore_for_coin(lobby_id: str, api_key: str):
             )
         except RuntimeError as exc:
             if "Agent not in lobby" in str(exc):
-                latest = redis_get(f"lobby:{lobby_id}:state")
-                if latest and latest != "(nil)":
-                    try:
-                        latest_state = json.loads(latest)
-                        if latest_state.get("status") == "FINISHED":
-                            raise RuntimeError("Lobby finished before coin was collected") from exc
-                    except json.JSONDecodeError:
-                        pass
+                latest_state = get_lobby_state(lobby_id)
+                if latest_state and latest_state.get("status") == "FINISHED":
+                    raise RuntimeError("Lobby finished before coin was collected") from exc
             raise
         time.sleep(0.11)
 
     def refresh():
-        payload = redis_get(f"lobby:{lobby_id}:state")
-        if not payload or payload == "(nil)":
+        state_payload = get_lobby_state(lobby_id)
+        if not state_payload:
             raise RuntimeError("Lobby state missing during exploration")
-        state_payload = json.loads(payload)
         if state_payload.get("status") == "FINISHED":
             raise RuntimeError("Lobby finished before coin was collected")
         return state_payload
@@ -388,31 +622,6 @@ def explore_for_coin(lobby_id: str, api_key: str):
 
     raise RuntimeError("Exploration finished without collecting a coin")
 
-def get_lobby_agent_ids_by_slot(lobby_id: str):
-    output = run_cmd([
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        POSTGRES_USER,
-        "-d",
-        POSTGRES_DB,
-        "-tA",
-        "-c",
-        f"SELECT agent_id, slot FROM lobby_players WHERE lobby_id = '{lobby_id}' AND status = 'JOINED' ORDER BY slot ASC",
-    ])
-    rows = [line.strip() for line in output.splitlines() if line.strip()]
-    pairs = []
-    for line in rows:
-        agent_id, slot = line.split("|", 1)
-        pairs.append((int(slot), agent_id))
-    pairs.sort(key=lambda item: item[0])
-    return [agent_id for _, agent_id in pairs]
-
-
 def send_input(lobby_id: str, api_key: str, label: str, direction: str):
     if LOG_MOVES:
         log(f"{label} moved {direction}")
@@ -472,9 +681,9 @@ def two_player_collect_one_each(lobby_id: str, agent_ids, api_keys_by_agent):
     # Wait until enough coins exist to give each player one target.
     coin_deadline = time.time() + COIN_WAIT_SEC
     while time.time() < coin_deadline:
-        payload = redis_get(f"lobby:{lobby_id}:state")
-        if payload and payload != "(nil)":
-            state = json.loads(payload)
+        latest = get_lobby_state(lobby_id)
+        if latest:
+            state = latest
             if len(state.get("coins") or []) >= len(agent_ids):
                 break
         time.sleep(0.1)
@@ -491,10 +700,10 @@ def two_player_collect_one_each(lobby_id: str, agent_ids, api_keys_by_agent):
             log(f"P{agent_ids.index(aid)+1} targeting coin id={cid}@({tx},{ty})")
 
     while time.time() < deadline:
-        payload = redis_get(f"lobby:{lobby_id}:state")
-        if not payload or payload == "(nil)":
+        latest = get_lobby_state(lobby_id)
+        if not latest:
             raise RuntimeError("Lobby state missing during 2-player exploration")
-        state = json.loads(payload)
+        state = latest
         if state.get("status") == "FINISHED":
             break
 
@@ -519,9 +728,9 @@ def two_player_collect_one_each(lobby_id: str, agent_ids, api_keys_by_agent):
         time.sleep(0.11)
 
         # Check for score changes.
-        payload = redis_get(f"lobby:{lobby_id}:state")
-        if payload and payload != "(nil)":
-            state = json.loads(payload)
+        latest = get_lobby_state(lobby_id)
+        if latest:
+            state = latest
             for idx, agent_id in enumerate(agent_ids):
                 score = int(state["players"][agent_id]["score"])
                 if score > last_scores[agent_id]:
@@ -554,10 +763,10 @@ def two_player_compete_until_finish(lobby_id: str, agent_ids, api_keys_by_agent)
     last_tick = int(state.get("tick", 0) or 0)
     last_progress = time.time()
     while True:
-        payload = redis_get(f"lobby:{lobby_id}:state")
-        if not payload or payload == "(nil)":
+        latest = get_lobby_state(lobby_id)
+        if not latest:
             raise RuntimeError("Lobby state missing during 2-player demo")
-        state = json.loads(payload)
+        state = latest
         if state.get("status") == "FINISHED":
             return
 
@@ -600,23 +809,11 @@ def two_player_compete_until_finish(lobby_id: str, agent_ids, api_keys_by_agent)
 
 
 def wait_for_payout(lobby_id: str):
+    if not E2E_USE_DB_HELPERS:
+        raise RuntimeError("wait_for_payout requires E2E_USE_DB_HELPERS=1")
     deadline = time.time() + PAYOUT_WAIT_SEC
     while time.time() < deadline:
-        output = run_cmd([
-            "docker",
-            "compose",
-            "exec",
-            "-T",
-            "postgres",
-            "psql",
-            "-U",
-            POSTGRES_USER,
-            "-d",
-            POSTGRES_DB,
-            "-tA",
-            "-c",
-            f"SELECT id FROM payouts WHERE lobby_id = '{lobby_id}'",
-        ])
+        output = run_sql(f"SELECT id FROM payouts WHERE lobby_id = '{lobby_id}'")
         payout_id = output.strip()
         if payout_id:
             return payout_id
@@ -630,6 +827,8 @@ def wait_for_payout_execution(lobby_id: str, expected_coins: int):
     the API worker.
     """
     exec_wait_sec = float(os.getenv("E2E_PAYOUT_EXEC_WAIT_SEC", "45"))
+    if not E2E_USE_DB_HELPERS:
+        raise RuntimeError("wait_for_payout_execution requires E2E_USE_DB_HELPERS=1")
     deadline = time.time() + max(PAYOUT_WAIT_SEC, exec_wait_sec)
     payout_id = wait_for_payout(lobby_id)
 
@@ -637,28 +836,14 @@ def wait_for_payout_execution(lobby_id: str, expected_coins: int):
         return payout_id, 0, 0
 
     while time.time() < deadline:
-        output = run_cmd([
-            "docker",
-            "compose",
-            "exec",
-            "-T",
-            "postgres",
-            "psql",
-            "-U",
-            POSTGRES_USER,
-            "-d",
-            POSTGRES_DB,
-            "-tA",
-            "-c",
-            (
-                "SELECT "
-                "SUM(CASE WHEN status='SENT' THEN 1 ELSE 0 END)::int AS sent, "
-                "SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END)::int AS failed, "
-                "SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END)::int AS pending, "
-                "SUM(CASE WHEN tx_hash IS NOT NULL AND tx_hash <> '' THEN 1 ELSE 0 END)::int AS hashed "
-                f"FROM payout_items WHERE payout_id = '{payout_id}';"
-            ),
-        ])
+        output = run_sql(
+            "SELECT "
+            "SUM(CASE WHEN status='SENT' THEN 1 ELSE 0 END)::int AS sent, "
+            "SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END)::int AS failed, "
+            "SUM(CASE WHEN status='PENDING' THEN 1 ELSE 0 END)::int AS pending, "
+            "SUM(CASE WHEN tx_hash IS NOT NULL AND tx_hash <> '' THEN 1 ELSE 0 END)::int AS hashed "
+            f"FROM payout_items WHERE payout_id = '{payout_id}';"
+        )
         line = output.strip()
         if line:
             parts = line.split("|")
@@ -684,6 +869,84 @@ def wait_for_tx_receipt(tx_hash: str):
         time.sleep(2)
     raise RuntimeError(f"Transaction {tx_hash} not confirmed within {TX_WAIT_SEC:.0f}s")
 
+
+def execute_and_verify_payout(lobby_id: str, include_second_wallet: bool):
+    if not E2E_REQUIRE_PAYOUT:
+        log("E2E_REQUIRE_PAYOUT=0 -> skipping payout execution and balance checks.")
+        return
+
+    payout_id = None
+    if E2E_USE_DB_HELPERS:
+        payout_id = wait_for_payout(lobby_id)
+        log(f"Executing payout... {payout_id}")
+    else:
+        log(f"Executing payout for lobby {lobby_id} (DB helpers disabled)...")
+
+    before_1 = get_balance_wei(AGENT_PAYOUT_ADDRESS)
+    before_2 = get_balance_wei(AGENT2_PAYOUT_ADDRESS) if include_second_wallet else None
+    _, execute = http_json("POST", "/payouts/execute", body={"lobby_id": lobby_id})
+    sent = int(execute.get("sent", 0)) if isinstance(execute, dict) else 0
+    failed = int(execute.get("failed", 0)) if isinstance(execute, dict) else 0
+    log(f"Payout execute sent={sent} failed={failed}")
+    if sent == 0:
+        raise RuntimeError("Payout failed: no transactions were sent")
+
+    if not E2E_USE_DB_HELPERS:
+        log("E2E_USE_DB_HELPERS=0 -> skipping tx-hash and exact payout-amount DB checks.")
+        return
+
+    tx_hashes_raw = run_sql(
+        f"SELECT tx_hash FROM payout_items WHERE payout_id = '{payout_id}' AND status = 'SENT' ORDER BY attempted_at ASC"
+    )
+    tx_hashes = [line.strip() for line in tx_hashes_raw.splitlines() if line.strip()]
+    if not tx_hashes:
+        raise RuntimeError("Payout sent but no tx_hash recorded")
+
+    for h in tx_hashes:
+        log(f"Waiting for tx confirmation... {h}")
+        receipt = wait_for_tx_receipt(h)
+        status = receipt.get("status") if isinstance(receipt, dict) else None
+        if status not in ("0x1", "0x01", 1, True):
+            raise RuntimeError(f"Transaction failed (status={status})")
+
+    payout_rows = run_sql(
+        f"SELECT payout_address, amount_quai FROM payout_items WHERE payout_id = '{payout_id}' AND status = 'SENT'"
+    )
+    expected = {}
+    for line in payout_rows.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        addr, amt = line.split("|", 1)
+        expected[addr.strip().lower()] = quai_str_to_wei(amt.strip())
+
+    log("Waiting for balance update...")
+    deadline = time.time() + BALANCE_WAIT_SEC
+    while time.time() < deadline:
+        after_1 = get_balance_wei(AGENT_PAYOUT_ADDRESS)
+        ok_1 = after_1 - before_1 >= expected.get(AGENT_PAYOUT_ADDRESS.lower(), 1)
+
+        ok_2 = True
+        after_2 = None
+        if include_second_wallet and before_2 is not None:
+            after_2 = get_balance_wei(AGENT2_PAYOUT_ADDRESS)
+            ok_2 = after_2 - before_2 >= expected.get(AGENT2_PAYOUT_ADDRESS.lower(), 1)
+
+        if ok_1 and ok_2:
+            if include_second_wallet and after_2 is not None:
+                log(
+                    "Balances increased: "
+                    f"P1 {wei_to_quai(before_1)} -> {wei_to_quai(after_1)} "
+                    f"P2 {wei_to_quai(before_2)} -> {wei_to_quai(after_2)}"
+                )
+            else:
+                log(f"Balance increased: {wei_to_quai(before_1)} -> {wei_to_quai(after_1)}")
+            return
+        time.sleep(2)
+
+    raise RuntimeError(f"Balance did not increase within {BALANCE_WAIT_SEC:.0f}s")
+
+
 def _parse_quai_amount(raw) -> float:
     try:
         return float(str(raw).strip())
@@ -696,15 +959,27 @@ def scale_scenario():
     Large-scale load / payout demonstration.
     Default behavior is DRY RUN for payouts (does not send on-chain tx) unless E2E_SCALE_EXECUTE_PAYOUTS=1.
     """
+    if not E2E_USE_DB_HELPERS:
+        raise RuntimeError("Scale scenario requires E2E_USE_DB_HELPERS=1")
+
     scale_lobbies = int(os.getenv("E2E_SCALE_LOBBIES", "10"))
-    scale_players_per_lobby = int(os.getenv("E2E_SCALE_PLAYERS_PER_LOBBY", "10"))
+    scale_players_per_lobby = int(os.getenv("E2E_SCALE_PLAYERS_PER_LOBBY", os.getenv("E2E_AGENTS_PER_LOBBY", "10")))
     scale_fill_seconds = float(os.getenv("E2E_SCALE_FILL_SECONDS", "300"))
     scale_duration_sec = int(os.getenv("E2E_SCALE_DURATION_SEC", "60"))
     scale_coins_per_match = int(os.getenv("E2E_SCALE_COINS_PER_MATCH", "10"))
-    scale_reward_pool_quai = os.getenv("E2E_SCALE_REWARD_POOL_QUAI", "10")
+    scale_reward_pool_quai = os.getenv("E2E_SCALE_REWARD_POOL_QUAI", os.getenv("E2E_PAYOUT_AMOUNT", "10"))
     scale_execute_payouts = os.getenv("E2E_SCALE_EXECUTE_PAYOUTS", "0") == "1"
     scale_input_every_ticks = int(os.getenv("E2E_SCALE_INPUT_EVERY_TICKS", "1"))
     scale_runners_per_lobby = int(os.getenv("E2E_SCALE_RUNNERS_PER_LOBBY", str(scale_players_per_lobby)))
+
+    # Optional alias: E2E_AGENT_AMOUNT as TOTAL agents in scale mode.
+    # If provided, derive lobby count from agents_per_lobby.
+    scale_agent_amount = os.getenv("E2E_AGENT_AMOUNT", "").strip()
+    if scale_agent_amount:
+        total = int(scale_agent_amount)
+        if total <= 0:
+            raise RuntimeError("E2E_AGENT_AMOUNT must be > 0")
+        scale_lobbies = max(1, math.ceil(total / max(1, scale_players_per_lobby)))
 
     total_agents = scale_lobbies * scale_players_per_lobby
     join_interval = scale_fill_seconds / max(1, total_agents)
@@ -832,12 +1107,8 @@ def scale_scenario():
         for lobby_id, record in lobbies.items():
             if record.get("finished"):
                 continue
-            payload = redis_get(f"lobby:{lobby_id}:state")
-            if not payload or payload == "(nil)":
-                continue
-            try:
-                state = json.loads(payload)
-            except json.JSONDecodeError:
+            state = get_lobby_state(lobby_id)
+            if not state:
                 continue
 
             status = state.get("status")
@@ -1108,12 +1379,7 @@ def scale_scenario():
         label = f"S{idx+1:03d}"
         api_key = register_agent(payout_address, label)
 
-        _status, joined = http_json(
-            "POST",
-            "/lobbies/join",
-            body={"game_mode_id": game_mode_id},
-            headers={"x-api-key": api_key},
-        )
+        _status, joined = join_lobby(game_mode_id, api_key, label=label)
         lobby_id = joined["lobby_id"]
         watch_code = joined.get("watch_code") or ""
         status = joined.get("status") or ""
@@ -1180,8 +1446,10 @@ def main():
     if not TREASURY_PRIVATE_KEY:
         if SCENARIO == "scale" and os.getenv("E2E_SCALE_EXECUTE_PAYOUTS", "0") != "1":
             log("QUAI_TREASURY_PRIVATE_KEY not set; running scale scenario in DRY RUN mode (no on-chain payouts).")
+        elif not E2E_REQUIRE_PAYOUT:
+            log("QUAI_TREASURY_PRIVATE_KEY not set; continuing with E2E_REQUIRE_PAYOUT=0.")
         else:
-            raise RuntimeError("QUAI_TREASURY_PRIVATE_KEY is required for chain payout test")
+            raise RuntimeError("QUAI_TREASURY_PRIVATE_KEY is required when E2E_REQUIRE_PAYOUT=1")
 
     log(
         "E2E timeouts: "
@@ -1193,7 +1461,13 @@ def main():
         f"tx_wait={TX_WAIT_SEC}s "
         f"balance={BALANCE_WAIT_SEC}s"
     )
-    log("Redis:" + f" {REDIS_HOST}:{REDIS_PORT} " + ("(docker exec fallback)" if REDIS_FORCE_DOCKER else "(socket preferred)"))
+    log(
+        "State source: "
+        f"{E2E_STATE_SOURCE} "
+        f"(use_existing_stack={int(E2E_USE_EXISTING_STACK)} "
+        f"db_helpers={int(E2E_USE_DB_HELPERS)} "
+        f"require_payout={int(E2E_REQUIRE_PAYOUT)})"
+    )
 
     log("Checking API health...")
     http_json("GET", "/health")
@@ -1203,9 +1477,12 @@ def main():
         return
 
     api_key_1 = register_agent(AGENT_PAYOUT_ADDRESS, "P1")
+    agent_id_1 = get_agent_id(api_key_1)
     api_key_2 = None
+    agent_id_2 = None
     if PLAYER_COUNT >= 2:
         api_key_2 = register_agent(AGENT2_PAYOUT_ADDRESS, "P2")
+        agent_id_2 = get_agent_id(api_key_2)
 
     if DEMO_UI:
         completion_players = 2 if PLAYER_COUNT >= 2 else 1
@@ -1213,16 +1490,15 @@ def main():
             raise RuntimeError("E2E_DEMO_UI=1 requires E2E_PLAYER_COUNT=2")
 
         coins = GAME_COINS_PER_MATCH if GAME_COINS_PER_MATCH > 0 else max(10, GAME_DURATION_SEC)
-        log(f"Creating game mode for UI demo... players=2 duration={GAME_DURATION_SEC}s coins={coins}")
-        game_mode_id = create_game_mode(max_players=2, duration_sec=GAME_DURATION_SEC, coins_per_match=coins)
+        if E2E_USE_DB_HELPERS:
+            log(f"Creating game mode for UI demo... players=2 duration={GAME_DURATION_SEC}s coins={coins}")
+            game_mode_id = get_or_create_game_mode(max_players=2, duration_sec=GAME_DURATION_SEC, coins_per_match=coins)
+        else:
+            game_mode_id = get_or_create_game_mode(max_players=2, duration_sec=GAME_DURATION_SEC, coins_per_match=coins)
+            log(f"Using existing game mode for UI demo: {game_mode_id}")
 
         log("Joining lobby (demo run) as P1...")
-        _, joined = http_json(
-            "POST",
-            "/lobbies/join",
-            body={"game_mode_id": game_mode_id},
-            headers={"x-api-key": api_key_1},
-        )
+        _, joined = join_lobby(game_mode_id, api_key_1, label="P1 demo")
         lobby_id = joined["lobby_id"]
         watch_code = joined.get("watch_code") or ""
         if watch_code:
@@ -1237,280 +1513,68 @@ def main():
         if not api_key_2:
             raise RuntimeError("E2E_DEMO_UI=1 requires P2 api key")
         log("Joining lobby (demo run) as P2...")
-        http_json(
-            "POST",
-            "/lobbies/join",
-            body={"game_mode_id": game_mode_id},
-            headers={"x-api-key": api_key_2},
-        )
+        join_lobby(game_mode_id, api_key_2, label="P2 demo")
+        ensure_lobby_active(game_mode_id, lobby_id)
 
-        agent_ids = get_lobby_agent_ids_by_slot(lobby_id)
-        if len(agent_ids) != 2:
-            raise RuntimeError(f"Expected 2 agents in lobby, found {len(agent_ids)}")
-        api_keys_by_agent = {agent_ids[0]: api_key_1, agent_ids[1]: api_key_2}
+        if not agent_id_2:
+            raise RuntimeError("E2E_DEMO_UI=1 requires P2 agent id")
+        agent_ids = [agent_id_1, agent_id_2]
+        api_keys_by_agent = {agent_id_1: api_key_1, agent_id_2: api_key_2}
 
         log("Agents competing until lobby ends...")
         two_player_compete_until_finish(lobby_id, agent_ids, api_keys_by_agent)
 
         log("Waiting for lobby to finish...")
         wait_for_lobby_finish(lobby_id)
+        execute_and_verify_payout(lobby_id, include_second_wallet=True)
+        return
 
-        payout_id = wait_for_payout(lobby_id)
-        log(f"Executing payout... {payout_id}")
+    if E2E_USE_DB_HELPERS:
+        log("Creating game mode for leave test...")
+        game_mode_id = get_or_create_game_mode(max_players=1, duration_sec=10, coins_per_match=1)
 
-        before_1 = get_balance_wei(AGENT_PAYOUT_ADDRESS)
-        before_2 = get_balance_wei(AGENT2_PAYOUT_ADDRESS)
-        _, execute = http_json("POST", "/payouts/execute", body={"lobby_id": lobby_id})
-        sent = int(execute.get("sent", 0)) if isinstance(execute, dict) else 0
-        failed = int(execute.get("failed", 0)) if isinstance(execute, dict) else 0
-        log(f"Payout execute sent={sent} failed={failed}")
-        if sent == 0:
-            failure = run_cmd([
-                "docker",
-                "compose",
-                "exec",
-                "-T",
-                "postgres",
-                "psql",
-                "-U",
-                POSTGRES_USER,
-                "-d",
-                POSTGRES_DB,
-                "-tA",
-                "-c",
-                f"SELECT error FROM payout_items WHERE payout_id = '{payout_id}' AND status = 'FAILED' LIMIT 1",
-            ])
-            raise RuntimeError(f"Payout failed: {failure.strip() or 'unknown error'}")
+        log("Joining lobby (leave test)...")
+        _, joined = join_lobby(game_mode_id, api_key_1, label="P1 leave")
+        lobby_id = joined["lobby_id"]
 
-        tx_hashes_raw = run_cmd([
-            "docker",
-            "compose",
-            "exec",
-            "-T",
-            "postgres",
-            "psql",
-            "-U",
-            POSTGRES_USER,
-            "-d",
-            POSTGRES_DB,
-            "-tA",
-            "-c",
-            f"SELECT tx_hash FROM payout_items WHERE payout_id = '{payout_id}' AND status = 'SENT' ORDER BY attempted_at ASC",
-        ])
-        tx_hashes = [line.strip() for line in tx_hashes_raw.splitlines() if line.strip()]
-        if not tx_hashes:
-            raise RuntimeError("Payout sent but no tx_hash recorded")
+        log("Leaving lobby...")
+        http_json(
+            "POST",
+            "/lobbies/leave",
+            body={"lobby_id": lobby_id},
+            headers={"x-api-key": api_key_1},
+        )
 
-        for h in tx_hashes:
-            log(f"Waiting for tx confirmation... {h}")
-            receipt = wait_for_tx_receipt(h)
-            status = receipt.get("status") if isinstance(receipt, dict) else None
-            if status not in ("0x1", "0x01", 1, True):
-                raise RuntimeError(f"Transaction failed (status={status})")
-
-        payout_rows = run_cmd([
-            "docker",
-            "compose",
-            "exec",
-            "-T",
-            "postgres",
-            "psql",
-            "-U",
-            POSTGRES_USER,
-            "-d",
-            POSTGRES_DB,
-            "-tA",
-            "-c",
-            f"SELECT payout_address, amount_quai FROM payout_items WHERE payout_id = '{payout_id}' AND status = 'SENT'",
-        ])
-        expected = {}
-        for line in payout_rows.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            addr, amt = line.split("|", 1)
-            expected[addr.strip().lower()] = quai_str_to_wei(amt.strip())
-
-        log("Waiting for balance update...")
-        deadline = time.time() + BALANCE_WAIT_SEC
-        while time.time() < deadline:
-            after_1 = get_balance_wei(AGENT_PAYOUT_ADDRESS)
-            after_2 = get_balance_wei(AGENT2_PAYOUT_ADDRESS)
-            ok_1 = after_1 - before_1 >= expected.get(AGENT_PAYOUT_ADDRESS.lower(), 1)
-            ok_2 = after_2 - before_2 >= expected.get(AGENT2_PAYOUT_ADDRESS.lower(), 1)
-            if ok_1 and ok_2:
-                log(
-                    "Balances increased: "
-                    f"P1 {wei_to_quai(before_1)} -> {wei_to_quai(after_1)} "
-                    f"P2 {wei_to_quai(before_2)} -> {wei_to_quai(after_2)}"
-                )
-                return
-            time.sleep(2)
-
-        raise RuntimeError(f"Balance did not increase within {BALANCE_WAIT_SEC:.0f}s")
-
-    log("Creating game mode for leave test...")
-    game_mode_id = create_game_mode(max_players=1, duration_sec=10, coins_per_match=1)
-
-    log("Joining lobby (leave test)...")
-    _, joined = http_json(
-        "POST",
-        "/lobbies/join",
-        body={"game_mode_id": game_mode_id},
-        headers={"x-api-key": api_key_1},
-    )
-    lobby_id = joined["lobby_id"]
-
-    log("Leaving lobby...")
-    http_json(
-        "POST",
-        "/lobbies/leave",
-        body={"lobby_id": lobby_id},
-        headers={"x-api-key": api_key_1},
-    )
-
-    log("Creating game mode for completion...")
+    log("Preparing game mode for completion...")
     completion_players = 1 if PLAYER_COUNT < 2 else 2
     completion_coins = completion_players
-    game_mode_id = create_game_mode(max_players=completion_players, duration_sec=10, coins_per_match=completion_coins)
+    game_mode_id = get_or_create_game_mode(max_players=completion_players, duration_sec=10, coins_per_match=completion_coins)
 
     log("Joining lobby (completion run)...")
-    _, joined = http_json(
-        "POST",
-        "/lobbies/join",
-        body={"game_mode_id": game_mode_id},
-        headers={"x-api-key": api_key_1},
-    )
+    _, joined = join_lobby(game_mode_id, api_key_1, label="P1 completion")
     lobby_id = joined["lobby_id"]
 
     if completion_players == 2:
         if not api_key_2:
             raise RuntimeError("E2E_PLAYER_COUNT=2 but P2 api key missing")
         # Second join should attach to the same WAITING lobby and activate it.
-        http_json(
-            "POST",
-            "/lobbies/join",
-            body={"game_mode_id": game_mode_id},
-            headers={"x-api-key": api_key_2},
-        )
-
-        agent_ids = get_lobby_agent_ids_by_slot(lobby_id)
-        if len(agent_ids) != 2:
-            raise RuntimeError(f"Expected 2 agents in lobby, found {len(agent_ids)}")
-        api_keys_by_agent = {agent_ids[0]: api_key_1, agent_ids[1]: api_key_2}
+        join_lobby(game_mode_id, api_key_2, label="P2 completion")
+        ensure_lobby_active(game_mode_id, lobby_id)
+        if not agent_id_2:
+            raise RuntimeError("E2E_PLAYER_COUNT=2 but P2 agent id missing")
+        agent_ids = [agent_id_1, agent_id_2]
+        api_keys_by_agent = {agent_id_1: api_key_1, agent_id_2: api_key_2}
 
         log("Exploring grid to collect 1 coin each...")
         two_player_collect_one_each(lobby_id, agent_ids, api_keys_by_agent)
     else:
+        ensure_lobby_active(game_mode_id, lobby_id)
         log("Exploring grid to find coin...")
         explore_for_coin(lobby_id, api_key_1)
 
     log("Waiting for lobby to finish...")
     wait_for_lobby_finish(lobby_id)
-
-    payout_id = wait_for_payout(lobby_id)
-    log(f"Executing payout... {payout_id}")
-
-    before_1 = get_balance_wei(AGENT_PAYOUT_ADDRESS)
-    before_2 = get_balance_wei(AGENT2_PAYOUT_ADDRESS) if completion_players == 2 else None
-    _, execute = http_json("POST", "/payouts/execute", body={"lobby_id": lobby_id})
-    sent = int(execute.get("sent", 0)) if isinstance(execute, dict) else 0
-    failed = int(execute.get("failed", 0)) if isinstance(execute, dict) else 0
-    log(f"Payout execute sent={sent} failed={failed}")
-    if sent == 0:
-        failure = run_cmd([
-            "docker",
-            "compose",
-            "exec",
-            "-T",
-            "postgres",
-            "psql",
-            "-U",
-            POSTGRES_USER,
-            "-d",
-            POSTGRES_DB,
-            "-tA",
-            "-c",
-            f"SELECT error FROM payout_items WHERE payout_id = '{payout_id}' AND status = 'FAILED' LIMIT 1",
-        ])
-        raise RuntimeError(f"Payout failed: {failure.strip() or 'unknown error'}")
-
-    # Pull all sent tx hashes (one per payout item). For 2 players we expect 2 txs.
-    tx_hashes_raw = run_cmd([
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        POSTGRES_USER,
-        "-d",
-        POSTGRES_DB,
-        "-tA",
-        "-c",
-        f"SELECT tx_hash FROM payout_items WHERE payout_id = '{payout_id}' AND status = 'SENT' ORDER BY attempted_at ASC",
-    ])
-    tx_hashes = [line.strip() for line in tx_hashes_raw.splitlines() if line.strip()]
-    if not tx_hashes:
-        raise RuntimeError("Payout sent but no tx_hash recorded")
-
-    for h in tx_hashes:
-        log(f"Waiting for tx confirmation... {h}")
-        receipt = wait_for_tx_receipt(h)
-        status = receipt.get("status") if isinstance(receipt, dict) else None
-        if status not in ("0x1", "0x01", 1, True):
-            raise RuntimeError(f"Transaction failed (status={status})")
-
-    # Read expected payout amounts from DB to validate both on-chain deltas.
-    payout_rows = run_cmd([
-        "docker",
-        "compose",
-        "exec",
-        "-T",
-        "postgres",
-        "psql",
-        "-U",
-        POSTGRES_USER,
-        "-d",
-        POSTGRES_DB,
-        "-tA",
-        "-c",
-        f"SELECT payout_address, amount_quai FROM payout_items WHERE payout_id = '{payout_id}' AND status = 'SENT'",
-    ])
-    expected = {}
-    for line in payout_rows.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        addr, amt = line.split("|", 1)
-        expected[addr.strip().lower()] = quai_str_to_wei(amt.strip())
-
-    log("Waiting for balance update...")
-    deadline = time.time() + BALANCE_WAIT_SEC
-    while time.time() < deadline:
-        after_1 = get_balance_wei(AGENT_PAYOUT_ADDRESS)
-        ok_1 = after_1 - before_1 >= expected.get(AGENT_PAYOUT_ADDRESS.lower(), 1)
-
-        ok_2 = True
-        after_2 = None
-        if completion_players == 2 and before_2 is not None:
-            after_2 = get_balance_wei(AGENT2_PAYOUT_ADDRESS)
-            ok_2 = after_2 - before_2 >= expected.get(AGENT2_PAYOUT_ADDRESS.lower(), 1)
-
-        if ok_1 and ok_2:
-            if completion_players == 2 and after_2 is not None:
-                log(
-                    "Balances increased: "
-                    f"P1 {wei_to_quai(before_1)} -> {wei_to_quai(after_1)} "
-                    f"P2 {wei_to_quai(before_2)} -> {wei_to_quai(after_2)}"
-                )
-            else:
-                log(f"Balance increased: {wei_to_quai(before_1)} -> {wei_to_quai(after_1)}")
-            return
-        time.sleep(2)
-
-    raise RuntimeError(f"Balance did not increase within {BALANCE_WAIT_SEC:.0f}s")
+    execute_and_verify_payout(lobby_id, include_second_wallet=(completion_players == 2))
 
 
 if __name__ == "__main__":
