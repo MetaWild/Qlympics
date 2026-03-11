@@ -959,9 +959,6 @@ def scale_scenario():
     Large-scale load / payout demonstration.
     Default behavior is DRY RUN for payouts (does not send on-chain tx) unless E2E_SCALE_EXECUTE_PAYOUTS=1.
     """
-    if not E2E_USE_DB_HELPERS:
-        raise RuntimeError("Scale scenario requires E2E_USE_DB_HELPERS=1")
-
     scale_lobbies = int(os.getenv("E2E_SCALE_LOBBIES", "10"))
     scale_players_per_lobby = int(os.getenv("E2E_SCALE_PLAYERS_PER_LOBBY", os.getenv("E2E_AGENTS_PER_LOBBY", "10")))
     scale_fill_seconds = float(os.getenv("E2E_SCALE_FILL_SECONDS", "300"))
@@ -981,6 +978,58 @@ def scale_scenario():
             raise RuntimeError("E2E_AGENT_AMOUNT must be > 0")
         scale_lobbies = max(1, math.ceil(total / max(1, scale_players_per_lobby)))
 
+    if E2E_USE_DB_HELPERS:
+        log(
+            "Creating scale game mode... "
+            f"max_players={scale_players_per_lobby} duration={scale_duration_sec}s "
+            f"coins={scale_coins_per_match} reward_pool_quai={scale_reward_pool_quai}"
+        )
+        game_mode_id = create_game_mode(
+            max_players=scale_players_per_lobby,
+            duration_sec=scale_duration_sec,
+            coins_per_match=scale_coins_per_match,
+            reward_pool_quai=scale_reward_pool_quai,
+        )
+    else:
+        game_mode_id = get_or_create_game_mode(
+            max_players=scale_players_per_lobby,
+            duration_sec=scale_duration_sec,
+            coins_per_match=scale_coins_per_match,
+            reward_pool_quai=scale_reward_pool_quai,
+        )
+        _status, games = http_json("GET", "/games")
+        selected = None
+        for g in games:
+            if str(g.get("id", "")) == game_mode_id:
+                selected = g
+                break
+        if selected is None:
+            raise RuntimeError(
+                f"Scale API-only mode could not resolve active game mode id={game_mode_id}. "
+                "Set E2E_GAME_MODE_ID to an active game mode from /games."
+            )
+        mode_players = int(selected.get("max_players", 0) or 0)
+        mode_duration = int(selected.get("duration_sec", 0) or 0)
+        mode_coins = int(selected.get("coins_per_match", 0) or 0)
+        mode_pool = str(selected.get("reward_pool_quai", scale_reward_pool_quai))
+        if mode_players <= 0:
+            raise RuntimeError(f"Selected game mode has invalid max_players: {mode_players}")
+        if mode_players != scale_players_per_lobby:
+            log(
+                "Scale API-only mode: overriding players_per_lobby "
+                f"{scale_players_per_lobby} -> {mode_players} to match game_mode_id={game_mode_id}"
+            )
+            scale_players_per_lobby = mode_players
+        if mode_duration > 0:
+            scale_duration_sec = mode_duration
+        if mode_coins > 0:
+            scale_coins_per_match = mode_coins
+        scale_reward_pool_quai = mode_pool
+        log(
+            "Scale API-only mode: using existing game mode "
+            f"id={game_mode_id} title={selected.get('title', '')!s}"
+        )
+
     total_agents = scale_lobbies * scale_players_per_lobby
     join_interval = scale_fill_seconds / max(1, total_agents)
 
@@ -990,7 +1039,7 @@ def scale_scenario():
         f"fill_seconds={scale_fill_seconds:.0f} join_interval={join_interval:.2f}s "
         f"duration_sec={scale_duration_sec} coins_per_match={scale_coins_per_match} "
         f"reward_pool_quai={scale_reward_pool_quai} execute_payouts={int(scale_execute_payouts)} "
-        f"input_every_ticks={scale_input_every_ticks}"
+        f"db_helpers={int(E2E_USE_DB_HELPERS)} input_every_ticks={scale_input_every_ticks}"
     )
     log(
         "Scale payout wallets: "
@@ -1000,18 +1049,6 @@ def scale_scenario():
     )
     if not scale_execute_payouts:
         log("Scale payouts: DRY RUN (no on-chain tx). Set E2E_SCALE_EXECUTE_PAYOUTS=1 to send transactions.")
-
-    log(
-        "Creating scale game mode... "
-        f"max_players={scale_players_per_lobby} duration={scale_duration_sec}s "
-        f"coins={scale_coins_per_match} reward_pool_quai={scale_reward_pool_quai}"
-    )
-    game_mode_id = create_game_mode(
-        max_players=scale_players_per_lobby,
-        duration_sec=scale_duration_sec,
-        coins_per_match=scale_coins_per_match,
-        reward_pool_quai=scale_reward_pool_quai,
-    )
 
     lobbies = {}
 
@@ -1331,7 +1368,7 @@ def scale_scenario():
             record["payout_executed"] = True
             return
         # Prefer instant payouts via the API worker (AUTO_PAYOUTS_ENABLED=1).
-        if os.getenv("AUTO_PAYOUTS_ENABLED", "0") == "1":
+        if os.getenv("AUTO_PAYOUTS_ENABLED", "0") == "1" and E2E_USE_DB_HELPERS:
             # We'll just verify completion; no manual /payouts/execute calls here to avoid blocking
             # agent driving and to match production behavior.
             try:
@@ -1345,6 +1382,11 @@ def scale_scenario():
                 return
             except Exception as exc:
                 log(f"Lobby {lobby_id} payout worker wait failed; falling back to manual execute: {exc}")
+        elif os.getenv("AUTO_PAYOUTS_ENABLED", "0") == "1" and not E2E_USE_DB_HELPERS:
+            log(
+                f"Lobby {lobby_id}: AUTO_PAYOUTS_ENABLED=1 with API-only scale mode; "
+                "cannot verify worker via DB, attempting manual /payouts/execute."
+            )
 
         try:
             _status, res = http_json("GET", f"/lobbies/{lobby_id}/result")
@@ -1359,13 +1401,36 @@ def scale_scenario():
             record["payout_executed"] = True
             return
 
-        payout_id = wait_for_payout(lobby_id)
-        log(f"Executing payout for lobby {lobby_id} ... {payout_id}")
-        _status, execute = http_json("POST", "/payouts/execute", body={"lobby_id": lobby_id})
-        sent = int(execute.get("sent", 0)) if isinstance(execute, dict) else int(execute.get("attempted", 0) or 0)
-        failed = int(execute.get("failed", 0)) if isinstance(execute, dict) else 0
-        log(f"Lobby {lobby_id} payout execute sent={sent} failed={failed}")
-        record["payout_executed"] = True
+        if E2E_USE_DB_HELPERS:
+            payout_id = wait_for_payout(lobby_id)
+            log(f"Executing payout for lobby {lobby_id} ... {payout_id}")
+            _status, execute = http_json("POST", "/payouts/execute", body={"lobby_id": lobby_id})
+            sent = int(execute.get("sent", 0)) if isinstance(execute, dict) else int(execute.get("attempted", 0) or 0)
+            failed = int(execute.get("failed", 0)) if isinstance(execute, dict) else 0
+            log(f"Lobby {lobby_id} payout execute sent={sent} failed={failed}")
+            record["payout_executed"] = True
+            return
+
+        # API-only mode: payout row creation may lag briefly after lobby finalization.
+        # Retry execute endpoint for a short period and don't hard-fail if the stack is already auto-paying.
+        deadline = time.time() + max(PAYOUT_WAIT_SEC, 20)
+        last_err = None
+        while time.time() < deadline:
+            try:
+                _status, execute = http_json("POST", "/payouts/execute", body={"lobby_id": lobby_id})
+                sent = int(execute.get("sent", 0)) if isinstance(execute, dict) else int(execute.get("attempted", 0) or 0)
+                failed = int(execute.get("failed", 0)) if isinstance(execute, dict) else 0
+                log(
+                    f"Lobby {lobby_id} payout execute (API-only) sent={sent} failed={failed} "
+                    "(DB verification skipped)"
+                )
+                record["payout_executed"] = True
+                return
+            except Exception as exc:
+                last_err = exc
+                time.sleep(1.0)
+
+        raise RuntimeError(f"Lobby {lobby_id} payout execution did not succeed in API-only mode: {last_err}")
 
     start = time.time()
     next_join_at = start
@@ -1435,16 +1500,21 @@ def scale_scenario():
         still = [rec.get("watch_code") or rec.get("lobby_id") for rec in lobbies.values() if not rec.get("finished")]
         raise RuntimeError(f"Scale scenario did not finish all lobbies before deadline. Remaining: {still}")
 
-    # Ensure payout rows exist (helps debugging in DRY RUN mode).
-    log("Scale post-phase: waiting for payout rows...")
-    for lobby_id in lobbies.keys():
-        payout_id = wait_for_payout(lobby_id)
-        log(f"Lobby {lobby_id} payout ready: {payout_id}")
+    if E2E_USE_DB_HELPERS:
+        # Ensure payout rows exist (helps debugging in DRY RUN mode).
+        log("Scale post-phase: waiting for payout rows...")
+        for lobby_id in lobbies.keys():
+            payout_id = wait_for_payout(lobby_id)
+            log(f"Lobby {lobby_id} payout ready: {payout_id}")
+    else:
+        log("Scale post-phase: DB helpers disabled; skipping payout-row checks.")
 
 
 def main():
     if not TREASURY_PRIVATE_KEY:
-        if SCENARIO == "scale" and os.getenv("E2E_SCALE_EXECUTE_PAYOUTS", "0") != "1":
+        if E2E_USE_EXISTING_STACK:
+            log("QUAI_TREASURY_PRIVATE_KEY not set locally; using existing stack configuration.")
+        elif SCENARIO == "scale" and os.getenv("E2E_SCALE_EXECUTE_PAYOUTS", "0") != "1":
             log("QUAI_TREASURY_PRIVATE_KEY not set; running scale scenario in DRY RUN mode (no on-chain payouts).")
         elif not E2E_REQUIRE_PAYOUT:
             log("QUAI_TREASURY_PRIVATE_KEY not set; continuing with E2E_REQUIRE_PAYOUT=0.")
