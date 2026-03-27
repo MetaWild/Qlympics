@@ -75,8 +75,18 @@ export async function executePayoutForLobby(opts: {
   // and double-send real Quai for the same payout items.
   const lockToken = await acquirePayoutLock(payout.id);
   if (!lockToken) {
-    log.info({ payoutId: payout.id, lobbyId }, 'Payout execution already in progress (lock held), skipping');
-    return { payout_id: payout.id, status: existingStatus as 'SENT' | 'FAILED', sent: 0, failed: 0 };
+    // Another process (e.g. the payout-worker) is already executing this payout.
+    // Re-read the DB status: if it's already terminal, return the result.
+    // If still PENDING, tell the caller to retry later.
+    const freshRows = await query<PayoutRow>(`SELECT status FROM payouts WHERE id = $1`, [payout.id]);
+    const freshStatus = String(freshRows[0]?.status || 'PENDING').toUpperCase();
+    if (freshStatus === 'SENT' || freshStatus === 'FAILED') {
+      log.info({ payoutId: payout.id, lobbyId, freshStatus }, 'Payout already completed by another process');
+      return { payout_id: payout.id, status: freshStatus as 'SENT' | 'FAILED', sent: 0, failed: 0 };
+    }
+    // Still in progress — throw so the caller can retry.
+    log.info({ payoutId: payout.id, lobbyId }, 'Payout execution in progress (lock held), caller should retry');
+    throw new Error(`Payout ${payout.id} execution in progress by another process`);
   }
 
   try {
