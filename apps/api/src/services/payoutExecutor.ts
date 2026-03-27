@@ -2,7 +2,6 @@ import { getAddress, keccak256, parseQuai, type Wallet } from 'quais';
 import { config } from '../config.js';
 import { reserveTreasuryNonces } from './treasuryNonce.js';
 import { redactSecrets, sanitizeError } from '../logging/sanitize.js';
-import { acquirePayoutLock, releasePayoutLock } from './payoutLock.js';
 
 export type PayoutRow = {
   id: string;
@@ -69,37 +68,32 @@ export async function executePayoutForLobby(opts: {
     }
   }
 
-  // Distributed lock: prevent the auto-payout worker and the POST /payouts/execute
-  // route (possibly on different containers) from executing the same payout concurrently.
-  // Without this lock, both callers can read items as PENDING, reserve different nonces,
-  // and double-send real Quai for the same payout items.
-  const lockToken = await acquirePayoutLock(payout.id);
-  if (!lockToken) {
-    // Another process (e.g. the payout-worker) is already executing this payout.
-    // Re-read the DB status: if it's already terminal, return the result.
-    // If still PENDING, tell the caller to retry later.
-    const freshRows = await query<PayoutRow>(`SELECT status FROM payouts WHERE id = $1`, [payout.id]);
-    const freshStatus = String(freshRows[0]?.status || 'PENDING').toUpperCase();
-    if (freshStatus === 'SENT' || freshStatus === 'FAILED') {
-      log.info({ payoutId: payout.id, lobbyId, freshStatus }, 'Payout already completed by another process');
-      return { payout_id: payout.id, status: freshStatus as 'SENT' | 'FAILED', sent: 0, failed: 0 };
-    }
-    // Still in progress — throw so the caller can retry.
-    log.info({ payoutId: payout.id, lobbyId }, 'Payout execution in progress (lock held), caller should retry');
-    throw new Error(`Payout ${payout.id} execution in progress by another process`);
-  }
-
-  try {
-
+  // Atomically claim PENDING items by moving them to CLAIMING status.
+  // This is a Postgres-level guarantee: only one process can claim each row.
+  // If two processes race, one gets the rows and the other gets zero rows.
+  // This prevents double-payment regardless of Redis locks or network conditions.
   const items = await query<PayoutItemRow>(
-    `SELECT id, payout_id, agent_id, payout_address, amount_quai, status
-     FROM payout_items
-     WHERE payout_id = $1 AND status = 'PENDING'`,
+    `UPDATE payout_items
+     SET status = 'CLAIMING'
+     WHERE id IN (
+       SELECT id FROM payout_items
+       WHERE payout_id = $1 AND status = 'PENDING'
+       FOR UPDATE SKIP LOCKED
+     )
+     RETURNING id, payout_id, agent_id, payout_address, amount_quai, status`,
     [payout.id]
   );
 
   if (!items.length) {
-    await query(`UPDATE payouts SET status = 'SENT' WHERE id = $1`, [payout.id]);
+    // No PENDING items to claim — either already done or another process claimed them.
+    // Check if all items are terminal; if so, mark the parent payout as complete.
+    const remaining = await query<PayoutItemRow>(
+      `SELECT status FROM payout_items WHERE payout_id = $1 AND status IN ('PENDING', 'CLAIMING')`,
+      [payout.id]
+    );
+    if (!remaining.length) {
+      await query(`UPDATE payouts SET status = 'SENT' WHERE id = $1 AND status != 'SENT'`, [payout.id]);
+    }
     return { payout_id: payout.id, status: 'SENT', sent: 0, failed: 0 };
   }
 
@@ -296,8 +290,4 @@ export async function executePayoutForLobby(opts: {
   }
 
   return { payout_id: payout.id, status: newStatus, sent: sentCount, failed: failedCount };
-
-  } finally {
-    await releasePayoutLock(payout.id, lockToken);
-  }
 }

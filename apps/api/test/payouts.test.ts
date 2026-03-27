@@ -60,3 +60,32 @@ test('executePayoutForLobby does not override SENT when no pending items remain'
   assert.equal(calls.some((c) => c.text.startsWith('UPDATE payouts')), false);
 });
 
+test('executePayoutForLobby returns sent=0 when another process already claimed items', async () => {
+  const calls: Array<{ text: string; params?: unknown[] }> = [];
+  const query = async (text: string, params?: unknown[]) => {
+    calls.push({ text, params });
+    // Payout exists and is PENDING
+    if (text.includes('FROM payouts') && !text.includes('payout_items')) {
+      return [{ id: 'p1', lobby_id: 'l1', status: 'PENDING', total_quai: '10' }];
+    }
+    // Atomic claim returns 0 rows (another process claimed them first)
+    if (text.includes("SET status = 'CLAIMING'")) {
+      return [];
+    }
+    // Check for remaining in-progress items
+    if (text.includes("IN ('PENDING', 'CLAIMING')")) {
+      return [{ status: 'CLAIMING' }]; // other process is still working
+    }
+    return [];
+  };
+
+  const res = await executePayoutForLobby({
+    lobbyId: 'l1',
+    query: query as any,
+    wallet: fakeWallet(),
+    log: console as any
+  });
+
+  assert.equal(res.sent, 0);
+  assert.equal(res.payout_id, 'p1');
+});
