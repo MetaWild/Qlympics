@@ -41,7 +41,16 @@ export function computePayouts(
     }
     // Each in-game coin has a fixed value: rewardPool / coinsPerMatch.
     // Uncollected coins are not distributed.
-    const amount = (rewardBig * BigInt(score)) / denom;
+    let amount = (rewardBig * BigInt(score)) / denom;
+    // Safety cap: never distribute more than the reward pool in total.
+    // The game engine should guarantee sum(scores) <= coinsPerMatch, but this
+    // guards against edge cases or future bugs that could cause overpayment.
+    if (distributed + amount > rewardBig) {
+      amount = rewardBig - distributed;
+      if (amount <= 0n) {
+        continue;
+      }
+    }
     distributed += amount;
     breakdown[agentId] = formatBigIntDecimal(amount, 18);
   }
