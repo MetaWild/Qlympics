@@ -48,7 +48,6 @@ export AUTO_PAYOUTS_ENABLED
 # Scale runs can trigger many RPC calls in a short period. Give Quai RPC a bit more breathing room.
 if [[ "${E2E_SCENARIO:-}" == "scale" && "${E2E_SCALE_EXECUTE_PAYOUTS:-0}" == "1" ]]; then
   export PAYOUT_RPC_TIMEOUT_MS="${PAYOUT_RPC_TIMEOUT_MS:-60000}"
-  export PAYOUT_ESTIMATE_ONCE="${PAYOUT_ESTIMATE_ONCE:-1}"
 fi
 
 # Scale demos can create many agents quickly; lower PoW difficulty by default so

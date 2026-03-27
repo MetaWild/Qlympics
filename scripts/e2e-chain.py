@@ -887,9 +887,12 @@ def execute_and_verify_payout(lobby_id: str, include_second_wallet: bool):
     _, execute = http_json("POST", "/payouts/execute", body={"lobby_id": lobby_id})
     sent = int(execute.get("sent", 0)) if isinstance(execute, dict) else 0
     failed = int(execute.get("failed", 0)) if isinstance(execute, dict) else 0
-    log(f"Payout execute sent={sent} failed={failed}")
-    if sent == 0:
-        raise RuntimeError("Payout failed: no transactions were sent")
+    payout_status = str(execute.get("status", "")).upper() if isinstance(execute, dict) else ""
+    log(f"Payout execute sent={sent} failed={failed} status={payout_status}")
+    # If the auto-payout worker already handled this lobby, the manual execute returns
+    # sent=0 with status=SENT (idempotent no-op).  That is success, not failure.
+    if sent == 0 and payout_status != "SENT":
+        raise RuntimeError("Payout failed: no transactions were sent and status is not SENT")
 
     if not E2E_USE_DB_HELPERS:
         log("E2E_USE_DB_HELPERS=0 -> skipping tx-hash and exact payout-amount DB checks.")

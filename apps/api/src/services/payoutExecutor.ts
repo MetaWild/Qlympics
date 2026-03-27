@@ -2,6 +2,7 @@ import { getAddress, keccak256, parseQuai, type Wallet } from 'quais';
 import { config } from '../config.js';
 import { reserveTreasuryNonces } from './treasuryNonce.js';
 import { redactSecrets, sanitizeError } from '../logging/sanitize.js';
+import { acquirePayoutLock, releasePayoutLock } from './payoutLock.js';
 
 export type PayoutRow = {
   id: string;
@@ -67,6 +68,18 @@ export async function executePayoutForLobby(opts: {
       return { payout_id: payout.id, status: existingStatus as 'SENT' | 'FAILED', sent: 0, failed: 0 };
     }
   }
+
+  // Distributed lock: prevent the auto-payout worker and the POST /payouts/execute
+  // route (possibly on different containers) from executing the same payout concurrently.
+  // Without this lock, both callers can read items as PENDING, reserve different nonces,
+  // and double-send real Quai for the same payout items.
+  const lockToken = await acquirePayoutLock(payout.id);
+  if (!lockToken) {
+    log.info({ payoutId: payout.id, lobbyId }, 'Payout execution already in progress (lock held), skipping');
+    return { payout_id: payout.id, status: existingStatus as 'SENT' | 'FAILED', sent: 0, failed: 0 };
+  }
+
+  try {
 
   const items = await query<PayoutItemRow>(
     `SELECT id, payout_id, agent_id, payout_address, amount_quai, status
@@ -273,4 +286,8 @@ export async function executePayoutForLobby(opts: {
   }
 
   return { payout_id: payout.id, status: newStatus, sent: sentCount, failed: failedCount };
+
+  } finally {
+    await releasePayoutLock(payout.id, lockToken);
+  }
 }
