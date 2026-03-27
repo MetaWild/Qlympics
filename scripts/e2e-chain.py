@@ -1017,21 +1017,40 @@ def scale_scenario():
         mode_pool = str(selected.get("reward_pool_quai", scale_reward_pool_quai))
         if mode_players <= 0:
             raise RuntimeError(f"Selected game mode has invalid max_players: {mode_players}")
+        # In API-only mode we cannot create/modify game modes in the DB, so the ACTUAL
+        # game will always run with the production game-mode values.  Warn when the
+        # user-supplied env vars differ, then adopt the real values so the test's
+        # expectations (timeouts, payout math) match what the server will actually do.
+        mismatches = []
         if mode_players != scale_players_per_lobby:
-            log(
-                "Scale API-only mode: overriding players_per_lobby "
-                f"{scale_players_per_lobby} -> {mode_players} to match game_mode_id={game_mode_id}"
-            )
+            mismatches.append(f"max_players: requested {scale_players_per_lobby}, game mode has {mode_players}")
             scale_players_per_lobby = mode_players
-        if mode_duration > 0:
+        if mode_duration > 0 and mode_duration != scale_duration_sec:
+            mismatches.append(f"duration_sec: requested {scale_duration_sec}, game mode has {mode_duration}")
             scale_duration_sec = mode_duration
-        if mode_coins > 0:
+        if mode_coins > 0 and mode_coins != scale_coins_per_match:
+            mismatches.append(f"coins_per_match: requested {scale_coins_per_match}, game mode has {mode_coins}")
             scale_coins_per_match = mode_coins
-        scale_reward_pool_quai = mode_pool
-        log(
-            "Scale API-only mode: using existing game mode "
-            f"id={game_mode_id} title={selected.get('title', '')!s}"
-        )
+        if mode_pool != str(scale_reward_pool_quai):
+            mismatches.append(f"reward_pool_quai: requested {scale_reward_pool_quai}, game mode has {mode_pool}")
+            scale_reward_pool_quai = mode_pool
+        if mismatches:
+            log(
+                "WARNING: API-only mode cannot modify game modes. "
+                "The following env var overrides are IGNORED because the actual game "
+                "uses the values stored in the production DB:"
+            )
+            for m in mismatches:
+                log(f"  - {m}")
+            log(
+                "To change these, update the production game mode via "
+                "`make game-mode-upsert` or the admin DB, then re-run."
+            )
+        else:
+            log(
+                "Scale API-only mode: using existing game mode "
+                f"id={game_mode_id} title={selected.get('title', '')!s}"
+            )
 
     total_agents = scale_lobbies * scale_players_per_lobby
     join_interval = scale_fill_seconds / max(1, total_agents)
